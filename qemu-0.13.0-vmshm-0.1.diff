@@ -1,0 +1,242 @@
+diff --git a/Makefile.target b/Makefile.target
+index 5364555..286e9b6 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -202,6 +202,8 @@ obj-$(CONFIG_USB_OHCI) += usb-ohci.o
+ obj-y += rtl8139.o
+ obj-y += e1000.o
+ 
++obj-y += vmshm.o
++
+ # Inter-VM PCI shared memory
+ obj-$(CONFIG_KVM) += ivshmem.o
+ 
+diff --git a/hw/vmshm.c b/hw/vmshm.c
+new file mode 100644
+index 0000000..b6d2047
+--- /dev/null
++++ b/hw/vmshm.c
+@@ -0,0 +1,223 @@
++/*
++ * vmshm --VMShm PCI Device.
++ *
++ * Copyright (C) 2009-2010  The University of Napoli Parthenope at Naples.
++ *
++ * This file is part of vmshm.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ * Written by: Giuseppe Coviello <giuseppe.coviello@uniparthenope.it>,
++ *             Department of Applied Science
++ */
++
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <poll.h>
++#include "hw.h"
++#include "pci.h"
++#include "pc.h"
++#include "qemu_socket.h"
++#include "qemu-thread.h"
++
++#define PCI_COMMAND_IOACCESS                0x0001
++#define PCI_COMMAND_MEMACCESS               0x0002
++#define PCI_COMMAND_BUSMASTER               0x0004
++
++#define DEBUG_VMSHM
++
++#ifdef DEBUG_VMSHM
++#define VMSHM_DPRINTF(fmt, args...)        \
++    do {printf("VMSHM: " fmt, ##args); } while (0)
++#else
++#define VMSHM_DPRINTF(fmt, args...)
++#endif
++
++/* Registers */
++/* Read Only */
++#define VMSHM_OPEN_L_REG       0x0
++#define VMSHM_CLOSE_L_REG      0x20
++
++/* Write Only */
++
++typedef struct VMShmState {
++     PCIDevice dev;
++
++     uint32_t regs_addr;
++
++     uint8_t *buffer;
++     unsigned long offset;
++     unsigned int size;
++     pcibus_t addr;
++
++     void *ioname;
++     uint32_t ioname_offset;
++     uint32_t ioname_size;
++
++     int fd;
++     int status;
++} VMShmState;
++
++static CPUWriteMemoryFunc *vmshm_regs_write[3] = {
++     NULL,
++     NULL,
++     NULL
++};
++
++static int vmshm_open(VMShmState *s) {
++     VMSHM_DPRINTF("Trying to open %s\n" , (char *) s->ioname);
++     s->fd = shm_open((char *) s->ioname, O_RDWR, 0600);
++
++     VMSHM_DPRINTF("shm_open: %d\n", s->fd);
++
++     if(s->fd <= 0)
++	  return s->fd;
++
++     s->buffer = mmap(NULL, s->size, PROT_READ | PROT_WRITE, MAP_SHARED, 
++		      s->fd, 0);
++     
++     if(s->buffer == MAP_FAILED) {
++	  close(s->fd);
++	  return -1;
++     }
++
++     char name[1024];
++     sprintf(name, "vmshm.buffer:%s (%d)\n", (char *) s->ioname, rand());
++     
++     s->offset = qemu_ram_alloc_from_ptr(&s->dev.qdev, name,
++					 s->size, s->buffer);
++
++     VMSHM_DPRINTF("trying to register\n");
++     cpu_register_physical_memory(s->addr, s->size, 
++				  s->offset);
++
++     return 0;
++}
++
++static uint32_t vmshm_regs_readl(void *opaque, target_phys_addr_t addr) {
++     VMShmState * s = opaque;
++     switch (addr & 0xFF) {
++     case VMSHM_OPEN_L_REG:
++	  return vmshm_open(s);
++     case VMSHM_CLOSE_L_REG:
++	  return s->status;
++     }
++     VMSHM_DPRINTF("reading long from invalid register 0x%x.\n", 
++		   (uint32_t) addr & 0xFF);
++     return 0;
++}
++
++static CPUReadMemoryFunc *vmshm_regs_read[3] = {
++     NULL,
++     NULL,
++     vmshm_regs_readl,
++};
++
++static void vmshm_region_map(PCIDevice *pci_dev, int region_num, 
++			     pcibus_t addr, pcibus_t size, int type) {
++     VMShmState *s = DO_UPCAST(VMShmState, dev, pci_dev);
++	
++     switch(region_num) {
++     case 0: 
++	  VMSHM_DPRINTF("Register regs at 0x%x.\n", (unsigned) addr);
++	  cpu_register_physical_memory(addr, 0x100, s->regs_addr);
++	  break;
++     case 1:
++	  VMSHM_DPRINTF("Register input buffer at 0x%x.\n", 
++			(unsigned) addr);
++	  s->addr = addr;
++	  cpu_register_physical_memory(addr, s->size, 
++				       s->offset);
++	  break;
++     case 2:
++	  VMSHM_DPRINTF("Buffer ioname at 0x%x.\n", 
++			(unsigned) addr);
++	  cpu_register_physical_memory(addr, s->ioname_size, 
++				       s->ioname_offset);
++	  break;
++     }
++}
++
++static void vmshm_reset(DeviceState *d) {
++}
++
++static int pci_vmshm_init(PCIDevice *dev) {
++     VMShmState *s = DO_UPCAST(VMShmState, dev, dev);
++     uint8_t *pci_conf;
++     
++     VMSHM_DPRINTF("Enabled!\n");
++     
++     /* Registers */
++     s->regs_addr = cpu_register_io_memory(vmshm_regs_read,
++					   vmshm_regs_write, s);
++
++     /* I/O Buffers */
++     s->size = 1024 * 1024; /* FIXME: make it configurable */
++     s->offset = 0;
++     s->offset = qemu_ram_alloc(&s->dev.qdev, "vmshm.buffer", s->size);
++     s->buffer = qemu_get_ram_ptr(s->offset);
++     
++     s->ioname_size = 1024 * 1024; /* FIXME: make it configurable */
++     s->ioname_offset = qemu_ram_alloc(&s->dev.qdev, "vmshm.name", 
++				       s->ioname_size);
++     s->ioname = qemu_get_ram_ptr(s->ioname_offset);
++
++     /* PCI config */
++     pci_conf = s->dev.config;
++     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_REDHAT_QUMRANET);
++     pci_config_set_device_id(pci_conf, 0x6661);
++     pci_config_set_class(pci_conf, PCI_CLASS_OTHERS);
++     pci_conf[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; // header_type
++     pci_conf[PCI_INTERRUPT_PIN] = 1; // we are going to support interrupts
++
++     /* Regions */
++     pci_register_bar(&s->dev, 0, 0x100, PCI_BASE_ADDRESS_SPACE_MEMORY, 
++		      vmshm_region_map);
++     pci_register_bar(&s->dev, 1, s->size, PCI_BASE_ADDRESS_SPACE_MEMORY,
++		      vmshm_region_map);
++     pci_register_bar(&s->dev, 2, s->ioname_size, PCI_BASE_ADDRESS_SPACE_MEMORY,
++		      vmshm_region_map);
++     
++     qemu_set_irq(s->dev.irq[0], 0);
++     
++     return 0;
++}
++
++static int pci_vmshm_uninit(PCIDevice *dev) {
++     return 0;
++}
++
++static PCIDeviceInfo vmshm_info = {
++    .qdev.name  = "vmshm",
++    .qdev.size  = sizeof(VMShmState),
++    .qdev.reset = vmshm_reset,
++    .init       = pci_vmshm_init,
++    .exit       = pci_vmshm_uninit,
++    .qdev.props = (Property[]) {
++        DEFINE_PROP_END_OF_LIST(),
++    }
++};
++
++static void vmshm_register_devices(void)
++{
++    pci_qdev_register(&vmshm_info);
++}
++
++device_init(vmshm_register_devices)
